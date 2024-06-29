@@ -1,6 +1,6 @@
 ---
 title: "Publication Bias"
-format: html
+format: gfm
 editor: visual
 ---
 
