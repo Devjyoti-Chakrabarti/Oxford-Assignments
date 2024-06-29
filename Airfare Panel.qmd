@@ -1,0 +1,247 @@
+---
+title: "Airfare Panel"
+format: html
+editor: visual
+---
+
+## Question 1
+
+```{r}
+# Loading libraries 
+library(tidyverse)
+library(estimatr)
+library(modelsummary)
+library(knitr)
+library(fixest)
+library(sandwich)
+library(plm)
+```
+
+```{r}
+# Loading data 
+data <- read_csv("https://ditraglia.com/data/usdot.csv")
+data
+```
+
+**Part a)** The principal reason behind including year dummies is to account for time varying factors that otherwise are not accounted for in our model. Some of these factors include the impact of inflation adjustments between years, policy changes and industry level shocks which affected airfares.
+
+We obtain statistically significant (at the 1% level) for the time dummies for the years 1999 and 2000. The positive sign of the coefficient indicates that airfares in that year were higher on average compared to the baseline year (1997), after controlling for market share and distance.
+
+```{r}
+# Question 1 Part a) 
+# Running the Regression
+reg_classical <- lm_robust(
+  log(airfare) ~ market_share + log(distance) + I(log(distance)^2) + as.factor(year),
+  data = data,
+  se_type = 'classical'
+)
+
+# Generate a summary table for the regression 
+modelsummary(
+  reg_classical,
+  gof_omit = 'R2 Adj,|AIC|BIC|F|Log.Lik.',
+  stars = TRUE
+)
+```
+
+**Part b)** The coefficient on `market_share` represents the percentage change (here 0.36%) in the average airfare associated with a one-unit change in market share, holding all other variables constant. We obtain the 95% confidence interval based on “plain-vanilla,” i.e. non-roust, standard errors for the coefficient on `market_share` using the `confint()` function.
+
+```{r}
+# Question 1 Part b)
+# Calculate the 95% confidence interval for the market_share coefficient 
+confint_market_share_classical <- confint(
+  reg_classical, 
+  "market_share", 
+  level = 0.95
+)
+
+# Print the confidence interval 
+confint_market_share_classical
+```
+
+**Part c)** We have data on each route distance, the average number of daily passengers, average one-way airfare, and market share of largest carrier for each route, so it is appropriate to cluster on `route_id`.
+
+There is no change in the coefficients of the covariates and the only change is in the standard errors (which is to be expected). The 95% confidence intervals for the Heteroskedasticity-Consistent and Cluster-Robust standard errors are much wider than that for the classical model. This is happening due to larger standard errors in the former.
+
+```{r}
+# Question 1 Part c)
+# Run a robust linear regression with heteroskedasticity-consistent standard errors
+reg_heterosked <- lm_robust(
+  log(airfare) ~ market_share + log(distance) + I(log(distance)^2) + as.factor(year),
+  data = data,
+  se_type = 'HC0'
+)
+
+# Run a robust linear regression with cluster-robust standard errors
+reg_cluster <- lm_robust(
+  log(airfare) ~ market_share + log(distance) + I(log(distance)^2) + as.factor(year),
+  data = data,
+  clusters = route_id
+)
+
+# Generate a summary table for the three regression models 
+modelsummary(
+  list(
+    Classical = reg_classical,
+    Heterosked = reg_heterosked,
+    Cluster = reg_cluster
+  ),
+  gof_omit = 'R2 Adj,|AIC|BIC|F|Log.Lik.',
+  stars = TRUE
+)
+
+# Calculate the 95% CI for the market_share coefficient in each model
+confint_market_share_heterosked <- confint(
+  reg_heterosked,
+  "market_share",
+  level = 0.95
+)
+
+confint_market_share_cluster <- confint(
+  reg_cluster,
+  "market_share",
+  level = 0.95
+)
+
+# Create a data frame to store the confidence intervals for the market_share coefficient
+ci_table <- data.frame(
+  Method = c("Classical", "Heteroskedasticity-Consistent", "Cluster-Robust"),
+  Lower_Bound = c(
+    confint_market_share_classical[1],
+    confint_market_share_heterosked[1],
+    confint_market_share_cluster[1]
+  ),
+  Upper_Bound = c(
+    confint_market_share_classical[2],
+    confint_market_share_heterosked[2],
+    confint_market_share_cluster[2]
+  )
+)
+
+# Print the confidence intervals table using knitr's kable function
+kable(
+  ci_table,
+  col.names = c("Method", "Lower Bound", "Upper Bound"),
+  caption = "Confidence Intervals for Market Share Coefficient"
+)
+
+```
+
+**Part d)** Part b)We use the code from the above regression to calculate the elasticity `airfare` with respect to `distance` for each route. Elasticity is given by:
+
+$$
+\epsilon = \frac{d(log(airfare))}{d(log(distance))}
+$$
+
+And from our regression this derivative is equal to:
+
+$$
+\frac{d(log(airfare))}{d(log(distance))} = \beta_1 + 2 * \beta_2 * log(distance)
+$$
+
+Using this the elasticity has been calculated below.
+
+Two things to note here:
+
+1.  Most elasticities are positive, this implies that as the distance between two cities increases so does the airfare. This is reasonable because longer flights tend to be more expensive.
+2.  We observe a slight right skew in the distribution of elasticity suggesting that most routes have low positive elasticity with a few routes having high elasticity.
+
+```{r}
+# Question 1 Part d)
+# Extract coefficients from the classical regression model
+coefficients <- coef(reg_classical)
+
+# Extract coefficients for log(distance) and log(distance)^2
+beta1 <- coefficients["log(distance)"]
+beta2 <- coefficients["I(log(distance)^2)"]
+
+# Compute the elasticity for each route
+data <- data |>
+  mutate(
+    log_dist = log(distance),  # Create a new column for log(distance)
+    elasticity = beta1 + 2 * beta2 * log_dist  # Compute elasticity
+  )
+
+# Extract unique route elasticity values
+route_elasticity <- data |>
+  select(route_id, elasticity) |>
+  distinct()
+
+# Display the route elasticity values
+route_elasticity
+
+# Plot histogram of elasticity values
+hist(
+  route_elasticity$elasticity,
+  main = "Elasticity of Airfare with Respect to Distance",
+  xlab = "Elasticity",
+  breaks = 30
+)
+```
+
+## Question 2
+
+**Part a)** Route fixed effects can be added to the model to account for route specific factors beyond those captured by `distance`, `market_share` and `year` dummies. These could be other factors like local market conditions, geographical or weather related effects etc. It also acts as a means for addressing a potential endogeneity problem between `airfare` and `market_share` .
+
+**Part b)** No we will not be able to estimate the elasticity of `airfare` with respect to `distance` if we add route fixed effects. Once route fixed effects are introduced, the `distance` no longer varies within each route since the variation in airfares due to differences in distance across routes is already captured by these fixed effects. The distance is same within each route.
+
+**Part c)** The summary of the classical and fixed-effects regression has been shown in the below table. Following from the previous part, there is no coeffcient for the `distance` variables in the latter since the fixed effects are absorbing all the variation that is constant within each route and `distance` no longer varies within each route. The coefficients on the time dummies are roughly the same in both regressions suggesting that the `year` dummies are capturing the overall time trends in airfares consistently.
+
+The coefficient on `market_share` decreasing by more than half suggesting that a lot of the variation in `airfare` attributed to `market_share` in the classical regression was actually due to unobserved route-specific factors. This leads us to believe that there is an omitted variable problem with the classical regression where we are not accounting for the unobserved heterogeneity across routes causing our estimates to be biased.
+
+```{r}
+# Question 2 Part c) 
+# Fixed effects model with route_id as the fixed effect
+fe_model <- feols(
+  log(airfare) ~ market_share + log(distance) + I(log(distance)^2) + 
+    as.factor(year) | route_id,
+  data = data
+)
+
+# Compute clustered standard errors
+robust_se <- vcovCL(fe_model, cluster = ~ route_id)
+
+# Generate a summary table for the classical regression and fixed effects model
+modelsummary(
+  list(Classical = reg_classical, Fixed_Effects = fe_model),
+  robust = list(Classical = NULL, Fixed_Effects = robust_se),
+  cluster = "route_id",
+  stars = TRUE
+)
+```
+
+## Question 3
+
+**Part a)** For this correlated random effects model, it is possible to calculate the elasticity of `airfare` with respect to `distance` since the variation in distance across routes is preserved.
+
+**Part b)** The random effects model has been estimated using the `plm` package and the results have been summarised below.
+
+```{r}
+# Question 3 Part b) 
+# Compute the mean market share by route and add it to the data
+data <- data |>
+  group_by(route_id) |>
+  mutate(time_mean_market_share = mean(market_share)) |>
+  ungroup()  # Ungroup to avoid affecting subsequent operations
+
+# Estimate the correlated random effects model
+cre_model <- plm(
+  log(airfare) ~ market_share + time_mean_market_share + log(distance) + I(log(distance)^2) + as.factor(year),
+  data = data,
+  model = "random",
+  index = c("route_id", "year")
+)
+
+# Generate a summary table for the classical regression, fixed-effects, and random effects models
+modelsummary(
+  list(
+    Classical = reg_classical,
+    Fixed_Effects = fe_model,
+    Correlated_Random_Effects = cre_model
+  ),
+  gof_omit = 'R2 Adj,|AIC|BIC|F|Log.Lik.',
+  stars = TRUE
+)
+```
+
+**Part c)** We find that the coefficient of `market_share` of the random effects model is the same as that in the fixed effects model (but with a smaller standard error in the former). The coefficients on the `year` dummies are approximately the same in all three models. And the coefficient of the `distance` variables are approximately equal in the random effects and classical regressions (but with much larger standard errors in the former).

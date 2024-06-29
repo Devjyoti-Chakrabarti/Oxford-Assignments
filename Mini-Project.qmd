@@ -1,0 +1,1399 @@
+---
+title: "Mini-Project"
+format: html
+editor: visual
+---
+
+I was replicating the paper **'Leaning against the Wind and Crisis Risk'** by Moritz Schularick, Lucas ter Steege, and Felix Ward. My task was to replicate Figures 1, 2, and 5 from the paper and provide a table for the summary statistics. The paper attempts to explore if central banks can defuse rising stability risks in financial booms by leaning against the wind with higher interest rates. It shows that discretionary leaning against the wind policies during credit and asset price booms are more likely to trigger crises than prevent them.
+
+This file contains the code and explanations for some of the more complicated functions.
+
+```{r, message = FALSE}
+# Loading Libraries
+library(tidyverse)
+library(dplyr)
+library(hpfilter)
+library(fixest)
+library(data.table)
+library(plotly)
+library(psych)
+library(lpirfs)
+library(patchwork)
+library(gridExtra)
+```
+
+```{r}
+# Loading Dataset
+data <- read_csv("mini_project_data.csv")
+data 
+```
+
+# Pre-Processing
+
+The pre-processing of the data is split into 4 steps. First, some additional variables are defined by manipulating the given dataset. Second, some of the variables are detrended using a one-sided Hodrick-Prescott filter. Third, an indicator variable for booms is created using some of the early defined variables. Fourth, the instruments are constructed which are then used in the analysis.
+
+## Transform and define variables
+
+```{r}
+# Transform and define variables
+data <- data |>
+  mutate(
+    stir = 100 * bill_rate,
+    lgdp = 100 * log(rgdppc),
+    lc = 100 * log(rconpc),
+    lri = 100 * log(iy * gdp * 10^6 / (cpi * pop)),
+    ltir = 100 * bond_rate,
+    lcredit = 100 * log(tloans / cpi),
+    lcpi = 100 * log(cpi),
+    cay = -100 * ca / gdp
+  )
+
+# Real house prices, normalized in 1990
+data <- data |>
+  mutate(hpreal = hpnom / cpi)
+
+# Normalize real house prices for each country code (ccode) based on 1990 values
+for (i in 1:17) {
+  mean_hpreal <- mean(data$hpreal[data$year == 1990 & data$ccode == i], na.rm = TRUE)
+  data <- data |>
+    mutate(hpreal = ifelse(ccode == i, hpreal / mean_hpreal, hpreal))
+}
+
+# Log transformation of real house prices
+data <- data |>
+  mutate(lhp = 100 * log(hpreal))
+
+# Real Stock prices, normalized in 1990
+data <- data |>
+  mutate(spnom = stocks)
+
+# Normalize nominal stock prices for each country code (ccode) based on 1990 values
+for (i in 1:16) {
+  mean_spnom <- mean(data$spnom[data$year == 1990 & data$ccode == i], na.rm = TRUE)
+  data <- data |>
+    mutate(spnom = ifelse(ccode == i, spnom / mean_spnom, spnom))
+}
+
+# Normalize real stock prices for each country code (ccode) based on 1990 values
+data <- data |>
+  mutate(stocksreal = spnom / cpi)
+
+for (i in 1:16) {
+  mean_stocksreal <- mean(data$stocksreal[data$year == 1990 & data$ccode == i], na.rm = TRUE)
+  data <- data |>
+    mutate(stocksreal = ifelse(ccode == i, stocksreal / mean_stocksreal, stocksreal))
+}
+
+# Log transformation of real stock prices
+data <- data |>
+  mutate(lsp = 100 * log(stocksreal))
+
+# Real GDP
+data <- data |>
+  mutate(
+    rgdp = gdp / cpi,
+    lrgdp = log(rgdp)
+  )
+
+# World GDP growth
+data <- data |>
+  mutate(gdp_ppp = rgdpmad * pop) |>
+  group_by(year) |>
+  mutate(
+    countgdpppp = sum(!is.na(gdp_ppp)),
+    sumGDP = ifelse(countgdpppp == 17, sum(gdp_ppp, na.rm = TRUE), NA)
+  ) |>
+  ungroup() |>
+  mutate(lsumgdp = log(sumGDP))
+
+# Generate first differences
+data <- data |>
+  mutate(
+    dstir = c(NA, diff(stir)),
+    dlgdp = c(NA, diff(lgdp)),
+    dlrgdp = c(NA, diff(lrgdp)),
+    dlc = c(NA, diff(lc)),
+    dlri = c(NA, diff(lri)),
+    dltir = c(NA, diff(ltir)),
+    dlhp = c(NA, diff(lhp)),
+    dlsp = c(NA, diff(lsp)),
+    dlcredit = c(NA, diff(lcredit)),
+    dcay  = c(NA, diff(cay)),
+    dlsumgdp = c(NA, diff(lsumgdp)),
+    dlcpi = c(NA, diff(lcpi))
+  )
+
+# Define Core dataset
+data <- data |>
+  mutate(core = ifelse((year >= 1870 & year <= 1908) |
+                       (year >= 1921 & year <= 1933) |
+                       (year >= 1948 & year <= 2006), 1, 0))
+
+# Create war time dummy
+data <- data |>
+  mutate(war = ifelse((year >= 1914 & year <= 1919) |
+                      (year >= 1939 & year <= 1947), 1, 0))
+
+# Exclude German Hyperinflation period
+data <- data |>
+  mutate(
+    hyper = ifelse(iso == "DEU" & (year >= 1920 & year <= 1925), 1, 0),
+    lhp = ifelse(hyper == 1, NA, lhp)
+  ) |>
+  filter(year <= 2016)
+```
+
+## Detrend relevant time series
+
+The authors in their stata code have used a function **tsspell** for identifying spells (consecutive observations satisfying some specified condition) in the data based on certain conditions. Then for each country and for each spell in that country, the one-sided HP filter is used for detrending. As far as I know there isn't any exact equivalent for **tsspell** in R. There are three variables that have to be detrended `lcredit`, `lsp`, `lhp`. I first try to implement code which replicates the functionality of tsspell before using the HP filter on these variables. I know this code is not pretty and there is probably more efficient ways for getting the same results, but this code perfectly detrends the required variables.
+
+```{r}
+country <- unique(data$ccode)
+time <- unique(data$year)
+
+smooth <- 100 # smoothness parameter for HP-filter
+
+# Detrending lcredit
+# Initialize new columns
+data$lcredit_pend <- 0
+data$lcredit_pseq <- 0
+data$lcredit_pspell <- 0
+
+# Initialize counters
+row <- 1
+total_rows <- nrow(data)
+spell <- 1
+index <- 1
+
+# Determining spells (Implementing tsspell functionality)
+while (row < total_rows) {
+  if (!is.na(data$lcredit[row])) {
+    data$lcredit_pspell[row] <- spell
+    data$lcredit_pseq[row] <- index
+    index <- index + 1
+    if (is.na(data$lcredit[row + 1])) {
+      data$lcredit_pend[row] <- 1
+      spell <- spell + 1
+    }
+  } else {
+    index <- 1
+  }
+  row <- row + 1
+}
+
+for (c in country) { 
+  country_spells <- unique(data$lcredit_pspell[data$ccode == c])
+  for (s in country_spells) {
+    max_seq <- max(data$lcredit_pseq[data$ccode == c & data$lcredit_pspell == s])
+    if (max_seq < 3) { # Spells have to atleast be of length 3 to use HP filter 
+      data$lcredit_pend[data$ccode == c & data$lcredit_pspell == s & data$lcredit_pend == 1] <- 0
+      data$lcredit_pseq[data$ccode == c & data$lcredit_pspell == s] <- 0
+      data$lcredit_pspell[data$ccode == c & data$lcredit_pspell == s] <- 0
+    }
+  }
+}
+
+data$lcredit_oshp <- NA
+# Looping through each country and each spell in each country for detrending
+for (c in country) { # country loop 
+  total_spells <- max(data$lcredit_pspell[data$ccode == c], 0)
+
+  if (total_spells > 0) {
+    for (s in 1:total_spells) { # spell loop 
+      length_spell <- max(data$lcredit_pseq[data$ccode == c & data$lcredit_pspell == s], 0)
+
+      if (length_spell > 0) {
+        for (z in 3:length_spell) {
+          subset_data <- data$lcredit[data$ccode == c & data$lcredit_pspell == s & data$lcredit_pseq <= z]
+
+          subset_data <- as.data.frame(subset_data)
+
+          # Apply HP filter
+          if (nrow(subset_data) >= 3) {
+            # Applying the HP filter
+            lcredit_trend <- hp1(subset_data, lambda = smooth)
+            cycle <- subset_data - lcredit_trend
+
+            data$lcredit_oshp[data$ccode == c & data$lcredit_pspell == s & data$lcredit_pseq == z] <- cycle[z, ]
+          }
+        }
+      }
+    }
+  }
+}
+
+data <- subset(data, select = -c(lcredit_pend, lcredit_pseq, lcredit_pspell))
+```
+
+```{r}
+# Detrending lsp
+# Initialize new columns
+data$lsp_pend <- 0
+data$lsp_pseq <- 0
+data$lsp_pspell <- 0
+
+# Initialize counters
+row <- 1
+total_rows <- nrow(data)
+spell <- 1
+index <- 1
+
+# Determining Spells (Implementing tsspell functionality)
+while (row < total_rows) {
+  if (!is.na(data$lsp[row])) {
+    data$lsp_pspell[row] <- spell
+    data$lsp_pseq[row] <- index
+    index <- index + 1
+    if (is.na(data$lsp[row + 1])) {
+      data$lsp_pend[row] <- 1
+      spell <- spell + 1
+    }
+  } else {
+    index <- 1
+  }
+  row <- row + 1
+}
+
+for (c in country) {
+  country_spells <- unique(data$lsp_pspell[data$ccode == c])
+  for (s in country_spells) {
+    max_seq <- max(data$lsp_pseq[data$ccode == c & data$lsp_pspell == s])
+    if (max_seq < 3) { # Spells have to atleast be of length 3 to use HP filter 
+      data$lsp_pend[data$ccode == c & data$lsp_pspell == s & data$lsp_pend == 1] <- 0
+      data$lsp_pseq[data$ccode == c & data$lsp_pspell == s] <- 0
+      data$lsp_pspell[data$ccode == c & data$lsp_pspell == s] <- 0
+    }
+  }
+}
+
+data$lsp_oshp <- NA
+# Looping through each country and each spell in each country for detrending
+for (c in country) { # country loop 
+  total_spells <- max(data$lsp_pspell[data$ccode == c], 0)
+
+  if (total_spells > 0) { 
+    for (s in 1:total_spells) { # spell loop 
+      length_spell <- max(data$lsp_pseq[data$ccode == c & data$lsp_pspell == s], 0)
+
+      if (length_spell > 0) {
+        for (z in 3:length_spell) {
+          subset_data <- data$lsp[data$ccode == c & data$lsp_pspell == s & data$lsp_pseq <= z]
+
+          # Ensure subset_data is a data frame
+          subset_data <- as.data.frame(subset_data)
+
+          # Apply HP filter
+          if (nrow(subset_data) >= 3) {
+            # Applying the HP filter
+            lsp_trend <- hp1(subset_data, lambda = smooth)
+
+            # Assuming hp1 returns the trend directly
+            cycle <- subset_data - lsp_trend
+
+            # Correct the assignment
+            data$lsp_oshp[data$ccode == c & data$lsp_pspell == s & data$lsp_pseq == z] <- cycle[z, ]
+          }
+        }
+      }
+    }
+  }
+}
+
+data <- subset(data, select = -c(lsp_pend, lsp_pseq, lsp_pspell))
+```
+
+```{r}
+# Detrending lhp
+# Initialize new columns
+data$lhp_pend <- 0
+data$lhp_pseq <- 0
+data$lhp_pspell <- 0
+
+# Initialize counters
+row <- 1
+total_rows <- nrow(data)
+spell <- 1
+index <- 1
+
+# Determining Spells (implementing tsspell functionality)
+while (row < total_rows) {
+  if (!is.na(data$lhp[row])) {
+    data$lhp_pspell[row] <- spell
+    data$lhp_pseq[row] <- index
+    index <- index + 1
+    if (is.na(data$lhp[row + 1])) {
+      data$lhp_pend[row] <- 1
+      spell <- spell + 1
+    }
+  } else {
+    index <- 1
+  }
+  row <- row + 1
+}
+
+for (c in country) {
+  country_spells <- unique(data$lhp_pspell[data$ccode == c])
+  for (s in country_spells) {
+    max_seq <- max(data$lhp_pseq[data$ccode == c & data$lhp_pspell == s])
+    if (max_seq < 3) {  # Spells have to atleast be of length 3 to use HP filter
+      data$lhp_pend[data$ccode == c & data$lhp_pspell == s & data$lhp_pend == 1] <- 0
+      data$lhp_pseq[data$ccode == c & data$lhp_pspell == s] <- 0
+      data$lhp_pspell[data$ccode == c & data$lhp_pspell == s] <- 0
+    }
+  }
+}
+
+data$lhp_oshp <- NA
+# Looping through each country and each spell in each country for detrending
+for (c in country) { # country loop 
+  total_spells <- max(data$lhp_pspell[data$ccode == c], 0)
+
+  if (total_spells > 0) {
+    for (s in 1:total_spells) { # spell loop 
+      length_spell <- max(data$lhp_pseq[data$ccode == c & data$lhp_pspell == s], 0)
+
+      if (length_spell > 0) {
+        for (z in 3:length_spell) {
+          subset_data <- data$lhp[data$ccode == c & data$lhp_pspell == s & data$lhp_pseq <= z]
+
+          # Ensure subset_data is a data frame
+          subset_data <- as.data.frame(subset_data)
+
+          # Apply HP filter
+          if (nrow(subset_data) >= 3) {
+            # Applying the HP filter
+            lhp_trend <- hp1(subset_data, lambda = smooth)
+
+            # Assuming hp1 returns the trend directly
+            cycle <- subset_data - lhp_trend
+
+            # Correct the assignment
+            data$lhp_oshp[data$ccode == c & data$lhp_pspell == s & data$lhp_pseq == z] <- cycle[z, ]
+          }
+        }
+      }
+    }
+  }
+}
+
+data <- subset(data, select = -c(lhp_pend, lhp_pseq, lhp_pspell))
+```
+
+## Define booms
+
+These are indicator variables that are being created. Take for example the boom indicator for credit booms. They take value 1 when the value of the `lcredit` is increasing (w.r.t the observation the year before) and is greater than the mean of `lcredit` for that country.
+
+Moreover, since there are cases where there can be a credit boom and a house/stock price boom, indicator variables for these joint booms are also created.
+
+```{r}
+# Initialize boom columns
+data$boom_lcredit_hp_os <- ifelse(!is.na(data$lcredit_oshp), 0, NA)
+data$boom_lsp_hp_os <- ifelse(!is.na(data$lsp_oshp), 0, NA)
+data$boom_lhp_hp_os <- ifelse(!is.na(data$lhp_oshp), 0, NA)
+total_rows <- nrow(data)
+
+for (i in 2:total_rows) {
+  country_code <- data$ccode[i]
+  # Compute mean values for each country
+  mean_lcredit <- mean(data$lcredit_oshp[data$ccode == country_code], na.rm = TRUE)
+  mean_lsp <- mean(data$lsp_oshp[data$ccode == country_code], na.rm = TRUE)
+  mean_lhp <- mean(data$lhp_oshp[data$ccode == country_code], na.rm = TRUE)
+  
+  # Determine booms
+  if (data$lcredit_oshp[i] > mean_lcredit & # greater than average lcredit 
+    (data$lcredit[i] - data$lcredit[i - 1] > 0) & # increasing w.r.t previous observation
+    !is.na(data$lcredit_oshp[i]) &
+    !is.na(data$lcredit[i]) &
+    !is.na(data$lcredit[i - 1])) {
+      data$boom_lcredit_hp_os[i] <- 1
+  }
+
+  if (data$lsp_oshp[i] > mean_lsp & # greater than average lsp
+    (data$lsp[i] - data$lsp[i - 1] > 0) & # increasing w.r.t previous observation
+    !is.na(data$lsp_oshp[i]) &
+    !is.na(data$lsp[i]) &
+    !is.na(data$lsp[i - 1])) {
+      data$boom_lsp_hp_os[i] <- 1
+  }
+
+  if (data$lhp_oshp[i] > mean_lhp & # greater than average lhp
+    (data$lhp[i] - data$lhp[i - 1] > 0) & # increasing w.r.t previous observation
+    !is.na(data$lhp_oshp[i]) &
+    !is.na(data$lhp[i]) &
+    !is.na(data$lhp[i - 1])) {
+      data$boom_lhp_hp_os[i] <- 1
+  }
+
+}
+
+# Joint Booms
+data$boom_lcredit_lsp_hp_os <- ifelse(!is.na(data$lcredit_oshp) & !is.na(data$lsp_oshp), 0, NA)
+data$boom_lcredit_lsp_hp_os[data$boom_lcredit_hp_os == 1 & data$boom_lsp_hp_os == 1] <- 1
+
+data$boom_lcredit_lhp_hp_os <- ifelse(!is.na(data$lcredit_oshp) & !is.na(data$lhp_oshp), 0, NA)
+data$boom_lcredit_lhp_hp_os[data$boom_lcredit_hp_os == 1 & data$boom_lhp_hp_os == 1] <- 1
+```
+
+## Construct instrument
+
+```{r}
+data$ibase <- NA
+data$z <- NA
+
+# Pre WWI UK is baserate
+data$ibase[data$year <= 1914 & data$iso != "GBR"] <- data$stir_gbr[data$year <= 1914 & data$iso != "GBR"]
+
+# Interwar is goldrate from Obstfeld, Shambaugh, Taylor, 2004
+data$ibase[data$year >= 1919 & data$year <= 1938 & data$iso != "GBR" & data$iso != "USA" & data$iso != "FRA"] <- data$goldr[data$year >= 1919 & data$year <= 1938 & data$iso != "GBR" & data$iso != "USA" & data$iso != "FRA"]
+
+# Bretton Woods US is baserate, except for Australia, which has UK rate
+data$ibase[data$year > 1945 & data$iso !="USA"] <- data$stir_usa[data$year > 1945 & data$iso !="USA"]
+data$ibase[data$year > 1945 & data$year <= 1966 & data$iso == "AUS"] <- data$stir_gbr[data$year > 1945 & data$year <= 1966 & data$iso == "AUS"] # sterling bloc
+
+# Post Bretton Woods US rate, except for the DM bloc
+euro_bloc_iso <- c("BEL", "CHE", "DNK", "ESP", "FIN", "FRA", "GBR", "ITA", "NLD", "PRT", "SWE")
+
+for (c in euro_bloc_iso){
+  data$ibase[data$year > 1973 & data$iso == c] <- data$stir_deu[data$year > 1973 & data$iso == c] # EMS/DEM/euro bloc
+}
+```
+
+```{r}
+# Instrument wo/ pre-whitening (no predictive regression yet)
+data$z <- c(NA, diff(data$ibase)) * data$peg * lag(data$peg, n = 1) * (data$openquinn / 100)
+data$z[is.na(data$z)] <- 0
+
+data <- data %>%
+  mutate(
+    # Defining lagged variables
+    l_dlc = lag(dlc, 1),
+    l_dltir = lag(dltir, 1),
+    l_dstir = lag(dstir, 1),
+    l_dlgdp = lag(dlgdp, 1),
+    l_dlcpi = lag(dlcpi, 1),
+    l_dlri = lag(dlri, 1),
+    l_cay = lag(cay, 1),
+    l_dlsp = lag(dlsp, 1),
+    l_dlcredit = lag(dlcredit, 1),
+    
+    # Initialize dstir_hat with NA values
+    dstir_hat = NA
+  )
+```
+
+```{r}
+# Performing fixed effects regression 
+subset_data_1939 <- data[data$year < 1939 & data$core == 1 & (data$iso %in% c("USA", "GBR", "FRA")) & data$hyper != 1, ]
+fe_model_1939 <- feols(dstir ~ l_dlc + l_dltir + l_dstir + l_dlgdp + l_dlcpi + l_dlri + l_cay + l_dlsp + l_dlcredit | country,
+                        data = subset_data_1939)
+temp_1939 <- predict(fe_model_1939, newdata = subset_data_1939, na.fill = TRUE)
+data$dstir_hat[data$year < 1939 & data$core==1 & (data$iso %in% c("USA", "GBR", "FRA")) & data$hyper != 1] <- temp_1939
+
+# Performing fixed effects regression 
+subset_data_1945 <- data[data$year > 1945 & data$core==1 & (data$iso %in% c("USA", "GBR", "DEU")) & data$hyper != 1, ]
+fe_model_1945 <- feols(dstir ~ l_dlc + l_dltir + l_dstir + l_dlgdp + l_dlcpi + l_dlri + l_cay + l_dlsp + l_dlcredit | country,
+                        data = subset_data_1945)
+temp_1945 <- predict(fe_model_1945, newdata = subset_data_1945, na.fill = TRUE)
+data$dstir_hat[data$year > 1945 & data$core==1 & (data$iso %in% c("USA", "GBR", "FRA")) & data$hyper != 1] <- temp_1945
+
+data$dstir_resid = data$dstir - data$dstir_hat
+
+# Initializing Columns 
+data$dibaseF_usa <- NA
+data$dibaseF_gbr <- NA
+data$dibaseF_deu <- NA
+data$dibaseF_fra <- NA
+
+data$dibaseF_usa[data$iso == "USA"] = data$dstir_resid[data$iso == "USA"]  # dibase for new IV
+data$dibaseF_gbr[data$iso == "GBR"] = data$dstir_resid[data$iso == "GBR"]  # dibase for new IV
+data$dibaseF_deu[data$iso == "DEU"] = data$dstir_resid[data$iso == "DEU"]  # dibase for new IV
+data$dibaseF_fra[data$iso == "FRA"] = data$dstir_resid[data$iso == "FRA"]  # dibase for new IV
+
+for (t in time) {
+  mean_dibaseF_usa <- mean(data$dibaseF_usa[data$year == t], na.rm = TRUE)
+  mean_dibaseF_gbr <- mean(data$dibaseF_gbr[data$year == t], na.rm = TRUE)
+  mean_dibaseF_deu <- mean(data$dibaseF_deu[data$year == t], na.rm = TRUE)
+  mean_dibaseF_fra <- mean(data$dibaseF_fra[data$year == t], na.rm = TRUE)
+
+  data$dibaseF_usa[data$year == t] <- mean_dibaseF_usa
+  data$dibaseF_gbr[data$year == t] <- mean_dibaseF_gbr
+  data$dibaseF_deu[data$year == t] <- mean_dibaseF_deu
+  data$dibaseF_fra[data$year == t] <- mean_dibaseF_fra
+}  
+```
+
+```{r}
+# compile base rate change
+data$dibaseF <- NA
+
+# US post WW2 is base with exceptions
+data$dibaseF[data$year > 1945 & data$iso != "USA"] <- data$dibaseF_usa[data$year > 1945 & data$iso != "USA"]
+
+# Sterling bloc until 1973
+data$dibaseF[data$year > 1945 & data$year <= 1966 & data$iso == "AUS"] <- data$dibaseF_usa[data$year > 1945 & data$year <= 1966 & data$iso == "AUS"] # sterling bloc
+
+# DM bloc after 1973
+for (c in euro_bloc_iso) {
+  data$dibaseF[data$year > 1973 & data$iso == c] <- data$dibaseF_deu[data$year > 1973 & data$iso == c] # EMS/DEM/euro bloc
+}
+
+# UK pre ww1 is base
+data$dibaseF[data$year <= 1914 & data$iso != "GBR"] <- data$dibaseF_gbr[data$year <= 1914 & data$iso != "GBR"]
+
+# use OST gold rate for interwar
+data$dibaseF[data$year >= 1919 & data$year <= 1925 & data$iso != "GBR" & data$iso != "USA" & data$iso != "FRA"] <- data$dibaseF_usa[data$year >= 1919 & data$year <= 1925 & data$iso !="GBR" & data$iso !="USA" & data$iso != "FRA"]
+
+data$dibaseF[data$year >= 1926 & data$year <= 1930 & data$iso != "GBR" & data$iso != "USA" & data$iso != "FRA"] <- (data$dibaseF_usa[data$year >= 1926 & data$year <= 1930 & data$iso !="GBR" & data$iso !="USA" & data$iso != "FRA"] + data$dibaseF_gbr[data$year >= 1926 & data$year <= 1930 & data$iso !="GBR" & data$iso !="USA" & data$iso != "FRA"] + data$dibaseF_fra[data$year >= 1926 & data$year <= 1930 & data$iso !="GBR" & data$iso !="USA" & data$iso != "FRA"]) / 3
+
+data$dibaseF[data$year >= 1931 & data$year <= 1932 & data$iso != "GBR" & data$iso != "USA" & data$iso != "FRA"] <- (data$dibaseF_usa[data$year >= 1931 & data$year <= 1932 & data$iso !="GBR" & data$iso !="USA" & data$iso != "FRA"] + data$dibaseF_fra[data$year >= 1931 & data$year <= 1932 & data$iso !="GBR" & data$iso !="USA" & data$iso != "FRA"]) / 2
+
+data$dibaseF[data$year >= 1933 & data$year <= 1938 & data$iso != "GBR" & data$iso != "USA" & data$iso != "FRA"] <- data$dibaseF_fra[data$year >= 1933 & data$year <= 1938 & data$iso !="GBR" & data$iso !="USA" & data$iso != "FRA"]
+```
+
+```{r}
+# generate impulse to short rate due to change in base when pegged in year T and T-1
+data$zF <- NA
+data$zF <- data$dibaseF * data$peg * lag(data$peg, n = 1) * (data$openquinn / 100)
+
+# Generate first stage results
+fe_model <- feols(dstir ~ zF, data = data)
+predicted_values <- predict(fe_model, newdata = data)
+
+# Assign the predicted values back to the original data
+data$zFr <- NA
+data$zFr <- predicted_values
+```
+
+## Summary Statistics
+
+The summary statistics for all the columns of the pre-processed dataset have been displayed below using the `describe()` function in the `psych` library.
+
+```{r}
+describe(data)
+```
+
+## Plotting Figure 1.
+
+This figure plots the house/stock prices for 6 countries. I wanted to try something different and have used `Plotly` for plotting the figures since it makes more interactive graphs. The blue line in the below figures represents the asset prices, a dark red denotes a boom and an empty red circle shows a credit boom. This figure completely matches for a majority of the countries with the figure in the paper.
+
+```{r}
+# Australia - House Prices 1889
+data$lhp_trend_hp <- data$lhp - data$lhp_oshp # Trend for House prices
+data$lsp_trend_hp <- data$lsp - data$lsp_oshp # Trend for Stock prices
+data$cycle_rebased_hp <- NA              # for rescaling relative to initial year
+
+# 1) Australia - House Prices 1889
+
+lhp <- data$lhp[data$iso == "AUS" & data$year == 1884]
+data$cycle_rebased_hp[data$iso == "AUS"] <- data$lhp[data$iso == "AUS"] - lhp
+
+plot_data <- data[data$iso == "AUS" & data$year >= 1884 & data$year <= 1894, ]
+
+plot_ly() %>%
+  add_lines(data = plot_data, x = ~year, y = ~cycle_rebased_hp, name = "Asset Prices", line = list(color = 'blue', width = 2)) %>%
+  add_markers(data = plot_data %>% filter(boom_lhp_hp_os == 1 & boom_lcredit_hp_os == 1), 
+              x = ~year, y = ~cycle_rebased_hp, name = "+ credit boom", 
+              marker = list(color = 'darkred', size = 10, symbol = 'circle', line = list(width = 2, color = 'red'))) %>%
+  add_markers(data = plot_data %>% filter(boom_lhp_hp_os == 1 & boom_lcredit_hp_os != 1), 
+              x = ~year, y = ~cycle_rebased_hp, name = "Boom", 
+              marker = list(color = 'darkred', size = 6, symbol = 'circle')) %>%
+  layout(title = list(text = "House Prices: Australia", font = list(size = 16)),
+         xaxis = list(title = list(text = "Year", font = list(size = 14, color = 'black', face = 'bold')), 
+                      tickvals = seq(1884, 1894, by = 5), 
+                      ticktext = seq(1884, 1894, by = 5),
+                      tickfont = list(size = 14, color = 'black', face = 'bold'),
+                      showline = TRUE, 
+                      linecolor = 'black'),
+         yaxis = list(title = list(text = "%", font = list(size = 14, color = 'black', face = 'bold')),
+                      tickvals = seq(0, 40, by = 10),
+                      ticktext = c("0", "10", "20", "30", "40"),
+                      tickfont = list(size = 14, color = 'black', face = 'bold'),
+                      showline = TRUE, 
+                      linecolor = 'black'),
+         legend = list(orientation = "h", x = 0.5, xanchor = "center", y = -0.2),
+         margin = list(t = 50, b = 50))
+```
+
+```{r}
+# 2) Netherlands - Stock Prices 1928
+
+lhp <- data$lhp[data$iso == "NLD" & data$year == 1923]
+data$cycle_rebased_hp[data$iso == "NLD"] <- data$lhp[data$iso == "NLD"] - lhp
+
+plot_data <- data[data$iso == "NLD" & data$year >= 1923 & data$year <= 1933, ]
+
+plot_ly() %>%
+  add_lines(data = plot_data, x = ~year, y = ~cycle_rebased_hp, name = "Stock Prices", line = list(color = 'blue', width = 2)) %>%
+  add_markers(data = plot_data %>% filter(boom_lhp_hp_os == 1 & boom_lcredit_hp_os == 1), 
+              x = ~year, y = ~cycle_rebased_hp, name = "+ credit boom", 
+              marker = list(color = 'darkred', size = 10, symbol = 'circle', line = list(width = 2, color = 'red'))) %>%
+  add_markers(data = plot_data %>% filter(boom_lhp_hp_os == 1 & boom_lcredit_hp_os != 1), 
+              x = ~year, y = ~cycle_rebased_hp, name = "Boom", 
+              marker = list(color = 'darkred', size = 6, symbol = 'circle')) %>%
+  layout(title = list(text = "Stock Prices: Netherlands", font = list(size = 16)),
+         xaxis = list(title = list(text = "Year", font = list(size = 14, color = 'black', face = 'bold')), 
+                      tickvals = seq(1923, 1933, by = 5), 
+                      ticktext = seq(1923, 1933, by = 5),
+                      tickfont = list(size = 14, color = 'black', face = 'bold'),
+                      showline = TRUE, 
+                      linecolor = 'black'),
+         yaxis = list(title = list(text = "%", font = list(size = 14, color = 'black', face = 'bold')),
+                      tickvals = seq(-60, 20, by = 20),
+                      ticktext = c("-60","-40","-20", "0", "20"),
+                      tickfont = list(size = 14, color = 'black', face = 'bold'),
+                      showline = TRUE, 
+                      linecolor = 'black'),
+         legend = list(orientation = "h", x = 0.5, xanchor = "center", y = -0.2),
+         margin = list(t = 50, b = 50))
+```
+
+```{r}
+# 3) Japan - Stock Prices 1989	
+
+lhp <- data$lhp[data$iso == "JPN" & data$year == 1984]
+data$cycle_rebased_hp[data$iso == "JPN"] <- data$lhp[data$iso == "JPN"] - lhp
+
+plot_data <- data[data$iso == "JPN" & data$year >= 1984 & data$year <= 1994, ]
+
+plot_ly() %>%
+  add_lines(data = plot_data, x = ~year, y = ~cycle_rebased_hp, name = "Stock Prices", line = list(color = 'blue', width = 2)) %>%
+  add_markers(data = plot_data %>% filter(boom_lhp_hp_os == 1 & boom_lcredit_hp_os == 1), 
+              x = ~year, y = ~cycle_rebased_hp, name = "+ credit boom", 
+              marker = list(color = 'darkred', size = 10, symbol = 'circle', line = list(width = 2, color = 'red'))) %>%
+  add_markers(data = plot_data %>% filter(boom_lhp_hp_os == 1 & boom_lcredit_hp_os != 1), 
+              x = ~year, y = ~cycle_rebased_hp, name = "Boom", 
+              marker = list(color = 'darkred', size = 6, symbol = 'circle')) %>%
+  layout(title = list(text = "Stock Prices: Japan", font = list(size = 16)),
+         xaxis = list(title = list(text = "Year", font = list(size = 14, color = 'black', face = 'bold')), 
+                      tickvals = seq(1984, 1994, by = 5), 
+                      ticktext = seq(1984, 1994, by = 5),
+                      tickfont = list(size = 14, color = 'black', face = 'bold'),
+                      showline = TRUE, 
+                      linecolor = 'black'),
+         yaxis = list(title = list(text = "%", font = list(size = 14, color = 'black', face = 'bold')),
+                      tickvals = seq(0, 100, by = 20),
+                      ticktext = c("0", "20", "40", "60", "80", "100"),
+                      tickfont = list(size = 14, color = 'black', face = 'bold'),
+                      showline = TRUE, 
+                      linecolor = 'black'),
+         legend = list(orientation = "h", x = 0.5, xanchor = "center", y = -0.2),
+         margin = list(t = 50, b = 50))
+```
+
+```{r}
+# 4) Sweden - House prices 1990
+
+lhp <- data$lhp[data$iso == "SWE" & data$year == 1985]
+data$cycle_rebased_hp[data$iso == "SWE"] <- data$lhp[data$iso == "SWE"] - lhp
+
+plot_data <- data[data$iso == "SWE" & data$year >= 1985 & data$year <= 1995, ]
+
+plot_ly() %>%
+  add_lines(data = plot_data, x = ~year, y = ~cycle_rebased_hp, name = "House Prices", line = list(color = 'blue', width = 2)) %>%
+  add_markers(data = plot_data %>% filter(boom_lhp_hp_os == 1 & boom_lcredit_hp_os == 1), 
+              x = ~year, y = ~cycle_rebased_hp, name = "+ credit boom", 
+              marker = list(color = 'darkred', size = 10, symbol = 'circle', line = list(width = 2, color = 'red'))) %>%
+  add_markers(data = plot_data %>% filter(boom_lhp_hp_os == 1 & boom_lcredit_hp_os != 1), 
+              x = ~year, y = ~cycle_rebased_hp, name = "Boom", 
+              marker = list(color = 'darkred', size = 6, symbol = 'circle')) %>%
+  layout(title = list(text = "House Prices: Sweden", font = list(size = 16)),
+         xaxis = list(title = list(text = "Year", font = list(size = 14, color = 'black', face = 'bold')), 
+                      tickvals = seq(1985, 1995, by = 5), 
+                      ticktext = seq(1985, 1995, by = 5),
+                      tickfont = list(size = 14, color = 'black', face = 'bold'),
+                      showline = TRUE, 
+                      linecolor = 'black'),
+         yaxis = list(title = list(text = "%", font = list(size = 14, color = 'black', face = 'bold')),
+                      tickvals = seq(0, 40, by = 10),
+                      ticktext = c("0", "10", "20", "30", "40"),
+                      tickfont = list(size = 14, color = 'black', face = 'bold'),
+                      showline = TRUE, 
+                      linecolor = 'black'),
+         legend = list(orientation = "h", x = 0.5, xanchor = "center", y = -0.2),
+         margin = list(t = 50, b = 50))
+```
+
+```{r}
+# 5) Italy - Stock Prices 1999
+
+lhp <- data$lhp[data$iso == "ITA" & data$year == 1994]
+data$cycle_rebased_hp[data$iso == "ITA"] <- data$lhp[data$iso == "ITA"] - lhp
+
+plot_data <- data[data$iso == "ITA" & data$year >= 1994 & data$year <= 2004, ]
+
+plot_ly() %>%
+  add_lines(data = plot_data, x = ~year, y = ~cycle_rebased_hp, name = "Stock Prices", line = list(color = 'blue', width = 2)) %>%
+  add_markers(data = plot_data %>% filter(boom_lhp_hp_os == 1 & boom_lcredit_hp_os == 1), 
+              x = ~year, y = ~cycle_rebased_hp, name = "+ credit boom", 
+              marker = list(color = 'darkred', size = 10, symbol = 'circle', line = list(width = 2, color = 'red'))) %>%
+  add_markers(data = plot_data %>% filter(boom_lhp_hp_os == 1 & boom_lcredit_hp_os != 1), 
+              x = ~year, y = ~cycle_rebased_hp, name = "Boom", 
+              marker = list(color = 'darkred', size = 6, symbol = 'circle')) %>%
+  layout(title = list(text = "Stock Prices: Italy", font = list(size = 16)),
+         xaxis = list(title = list(text = "Year", font = list(size = 14, color = 'black', face = 'bold')), 
+                      tickvals = seq(1994, 2004, by = 5), 
+                      ticktext = seq(1994, 2004, by = 5),
+                      tickfont = list(size = 14, color = 'black', face = 'bold'),
+                      showline = TRUE, 
+                      linecolor = 'black'),
+         yaxis = list(title = list(text = "%", font = list(size = 14, color = 'black', face = 'bold')),
+                      tickvals = seq(0, 40, by = 10),
+                      ticktext = c("0", "10", "20", "30", "40"),
+                      tickfont = list(size = 14, color = 'black', face = 'bold'),
+                      showline = TRUE, 
+                      linecolor = 'black'),
+         legend = list(orientation = "h", x = 0.5, xanchor = "center", y = -0.2),
+         margin = list(t = 50, b = 50))
+```
+
+```{r}
+# 6) Spain - House Prices 2007	
+
+lhp <- data$lhp[data$iso == "ESP" & data$year == 2001]
+data$cycle_rebased_hp[data$iso == "ESP"] <- data$lhp[data$iso == "AUS"] - lhp
+
+plot_data <- data[data$iso == "ESP" & data$year >= 2001 & data$year <= 2011, ]
+
+plot_ly() %>%
+  add_lines(data = plot_data, x = ~year, y = ~cycle_rebased_hp, name = "Asset Prices", line = list(color = 'blue', width = 2)) %>%
+  add_markers(data = plot_data %>% filter(boom_lhp_hp_os == 1 & boom_lcredit_hp_os == 1), 
+              x = ~year, y = ~cycle_rebased_hp, name = "+ credit boom", 
+              marker = list(color = 'darkred', size = 10, symbol = 'circle', line = list(width = 2, color = 'red'))) %>%
+  add_markers(data = plot_data %>% filter(boom_lhp_hp_os == 1 & boom_lcredit_hp_os != 1), 
+              x = ~year, y = ~cycle_rebased_hp, name = "Boom", 
+              marker = list(color = 'darkred', size = 6, symbol = 'circle')) %>%
+  layout(title = list(text = "House Prices: Spain", font = list(size = 16)),
+         xaxis = list(title = list(text = "Year", font = list(size = 14, color = 'black', face = 'bold')), 
+                      tickvals = seq(2001, 2011, by = 5), 
+                      ticktext = seq(2001, 2011, by = 5),
+                      tickfont = list(size = 14, color = 'black', face = 'bold'),
+                      showline = TRUE, 
+                      linecolor = 'black'),
+         yaxis = list(title = list(text = "%", font = list(size = 14, color = 'black', face = 'bold')),
+                      tickvals = seq(0, 80, by = 20),
+                      ticktext = c("0", "20", "40", "60", "80"),
+                      tickfont = list(size = 14, color = 'black', face = 'bold'),
+                      showline = TRUE, 
+                      linecolor = 'black'),
+         legend = list(orientation = "h", x = 0.5, xanchor = "center", y = -0.2),
+         margin = list(t = 50, b = 50))
+```
+
+## Plotting Figure 2.
+
+Figure 2 in the paper plots the 95% confidence bands for a change in the probability of an annual crisis following a monetary policy shock. This is done for 4 sub-samples of the data (the whole dataset, periods where there is a credit boom, periods where there is a credit boom and house price boom and finally periods where there is a credit boom and stock price boom).
+
+For the linear projections for this figure, the Stata code uses this variable called `rhs_ia`. I have checked the other code files and the pre-processed data provided by the authors, and nowhere does this variable exist. This did lead to some differing replications.
+
+For plotting this figure, I am using the `lpirfs` library.
+
+```{r}
+L <- 4 # Lags in LPs
+H <- 5 # Horizon
+data$ifsnr <- as.integer(factor(data$ifs)) 
+
+data <- data %>%
+  mutate(
+    ifsnr = as.integer(factor(ifs)),
+    crisis = 0
+  )
+
+total_row <- nrow(data)
+
+# Creating new indicator for crisis 
+for (i in 1:total_row) {
+  if (!is.na(data$crisis_JST_new[i]) & data$crisis_JST_new[i] == 1) {
+    data$crisis[i] <- 1
+  }
+  if (!is.na(data$crisis_JST_new[i + 1]) & data$crisis_JST_new[i + 1] == 1) {
+    data$crisis[i] <- 1
+  }
+  if (!is.na(data$crisis_JST_new[i + 1]) & data$crisis_JST_new[i + 1] == 1) {
+    data$crisis[i] <- 1
+  }    
+}
+```
+
+### Plotting for Full Sample
+
+```{r}
+data <- data[data$war == 0, ]
+
+full_sample_data <- data |>
+  select(country, year, crisis, zFr, dstir, dltir, dlcredit, dlsp, dlhp, dlgdp, dlcpi, dlri, dlc, cay, dlsumgdp, ifsnr) |>
+  drop_na()
+
+full_sample_model <- lp_lin_panel(data_set = full_sample_data,
+                    endog_data = "crisis", 
+                    shock = "zFr",
+                    cumul_mult = TRUE, 
+                    robust_cov = "vcovSCC", # robust standard errors
+                    c_exog_data = "ifsnr", 
+                    l_exog_data = colnames(full_sample_data)[5:15],
+                    lags_exog_data = L, # lags
+                    confint = 1.96, # width of confidence interval
+                    hor = H)
+```
+
+```{r}
+model_mean <- full_sample_model$irf_panel_mean * 100
+lower_bands <- full_sample_model$irf_panel_low * 100
+upper_bands <- full_sample_model$irf_panel_up * 100
+
+model_mean <- matrix(model_mean, nrow = 1)
+lower_bands <- matrix(lower_bands, nrow = 1)
+upper_bands <- matrix(upper_bands, nrow = 1)
+
+x <- 1:5 # X-axis values for the plot 
+
+plot(x, model_mean[1,], ylim=range(c(lower_bands, upper_bands)), pch=19, col='darkred',
+     xlab='Years', ylab='Percentage Points', main='Full Sample')
+
+# Add segments to represent the lower and upper bands
+segments(x, lower_bands[1,], x, upper_bands[1,], col='darkred')
+
+# Add points for lower and upper bands for clarity
+points(x, lower_bands[1,], pch=95, col='darkred')
+points(x, upper_bands[1,], pch=95, col='darkred')
+
+```
+
+### Plotting for Credit Booms
+
+```{r}
+data <- data[data$war == 0 & data$boom_lcredit_hp_os == 1,]
+
+credit_boom_data <- data |>
+  select(country, year, crisis, zFr, dstir, dltir, dlcredit, dlsp, dlhp, dlgdp, dlcpi, dlri, dlc, cay, dlsumgdp, ifsnr) |>
+  drop_na()
+
+credit_boom_model <- lp_lin_panel(data_set = credit_boom_data,
+                    endog_data = "crisis", 
+                    shock = "zFr",
+                    cumul_mult = TRUE, 
+                    robust_cov = "vcovSCC", # robust standard errors
+                    c_exog_data = "ifsnr", 
+                    l_exog_data = colnames(credit_boom_data)[5:15],
+                    lags_exog_data = L, # lags
+                    confint = 1.96, # width of confidence interval
+                    hor = H) # horizons
+```
+
+```{r}
+model_mean <- credit_boom_model$irf_panel_mean * 100
+lower_bands <- credit_boom_model$irf_panel_low * 100
+upper_bands <- credit_boom_model$irf_panel_up * 100
+
+model_mean <- matrix(model_mean, nrow = 1)
+lower_bands <- matrix(lower_bands, nrow = 1)
+upper_bands <- matrix(upper_bands, nrow = 1)
+
+x <- 1:5 # X-axis values for the plot 
+
+plot(x, model_mean[1,], ylim=range(c(lower_bands, upper_bands)), pch=19, col='darkred',
+     xlab='Years', ylab='Percentage Points', main='Credit Booms')
+
+# Add segments to represent the lower and upper bands
+segments(x, lower_bands[1,], x, upper_bands[1,], col='darkred')
+
+# Add points for lower and upper bands for clarity
+points(x, lower_bands[1,], pch=95, col='darkred')
+points(x, upper_bands[1,], pch=95, col='darkred')
+
+```
+
+### Plotting for Credit Booms + House Price Booms
+
+```{r}
+data <- data[data$war == 0 & data$boom_lcredit_lhp_hp_os == 1,]
+
+credit_hp_boom_data <- data |>
+  select(country, year, crisis, zFr, dstir, dltir, dlcredit, dlsp, dlhp, dlgdp, dlcpi, dlri, dlc, cay, dlsumgdp, ifsnr) |>
+  drop_na()
+
+credit_hp_boom_model <- lp_lin_panel(data_set = credit_hp_boom_data,
+                    endog_data = "crisis", 
+                    shock = "zFr",
+                    cumul_mult = TRUE, 
+                    robust_cov = "vcovSCC", # robust standard errors
+                    c_exog_data = "ifsnr", 
+                    l_exog_data = colnames(credit_hp_boom_data)[5:15],
+                    lags_exog_data = L, # lags
+                    confint = 1.96, # width of confidence interval
+                    hor = H) # horizons
+```
+
+```{r}
+model_mean <- credit_hp_boom_model$irf_panel_mean * 100
+lower_bands <- credit_hp_boom_model$irf_panel_low * 100
+upper_bands <- credit_hp_boom_model$irf_panel_up * 100
+
+model_mean <- matrix(model_mean, nrow = 1)
+lower_bands <- matrix(lower_bands, nrow = 1)
+upper_bands <- matrix(upper_bands, nrow = 1)
+
+x <- 1:5 # X-axis values for the plot 
+
+plot(x, model_mean[1,], ylim=range(c(lower_bands, upper_bands)), pch=19, col='darkred',
+     xlab='Years', ylab='Percentage Points', main='Credit Booms + House Price Booms')
+
+# Add segments to represent the lower and upper bands
+segments(x, lower_bands[1,], x, upper_bands[1,], col='darkred')
+
+# Add points for lower and upper bands for clarity
+points(x, lower_bands[1,], pch=95, col='darkred')
+points(x, upper_bands[1,], pch=95, col='darkred')
+```
+
+### Plotting for Credit Booms + Stock Price Booms
+
+```{r}
+data <- data[data$war == 0 & data$boom_lcredit_lsp_hp_os == 1,]
+
+credit_sp_boom_data <- data |>
+  select(country, year, crisis, zFr, dstir, dltir, dlcredit, dlsp, dlhp, dlgdp, dlcpi, dlri, dlc, cay, dlsumgdp, ifsnr) |>
+  drop_na()
+
+credit_sp_boom_model <- lp_lin_panel(data_set = credit_sp_boom_data,
+                    endog_data = "crisis", 
+                    shock = "zFr",
+                    cumul_mult = TRUE, 
+                    robust_cov = "vcovSCC", # robust standard errors 
+                    c_exog_data = "ifsnr", 
+                    l_exog_data = colnames(credit_sp_boom_data)[5:15],
+                    lags_exog_data = L, # lags
+                    confint = 1.96, # width of confidence interval
+                    hor = H) # horizons
+```
+
+```{r}
+model_mean <- credit_sp_boom_model$irf_panel_mean * 100
+lower_bands <- credit_sp_boom_model$irf_panel_low * 100
+upper_bands <- credit_sp_boom_model$irf_panel_up * 100
+
+model_mean <- matrix(model_mean, nrow = 1)
+lower_bands <- matrix(lower_bands, nrow = 1)
+upper_bands <- matrix(upper_bands, nrow = 1)
+
+x <- 1:5 # X-axis values for the plot 
+
+plot(x, model_mean[1,], ylim=range(c(lower_bands, upper_bands)), pch=19, col='darkred',
+     xlab='Years', ylab='Percentage Points', main='Credit Booms + Stock Price Booms')
+
+# Add segments to represent the lower and upper bands
+segments(x, lower_bands[1,], x, upper_bands[1,], col='darkred')
+
+# Add points for lower and upper bands for clarity
+points(x, lower_bands[1,], pch=95, col='darkred')
+points(x, upper_bands[1,], pch=95, col='darkred')
+```
+
+## Plotting Figure 5.
+
+From what I understand, Figure 5 is making impulse response functions using local projections. It does this for 4 degrees of leaning; no leaning, over a one-year, three-year, and five-year horizon. This is then plotted for the full sample and for three subsamples (where there is only a credit boom, where there is a credit boom and house price boom, where there is credit boom and a stock price boom). There is a library in R called `lpirfs` which I think has functionality as close as possible for replicating these results. This has been used below for plotting the IRFs.
+
+So take for example the full sample graph. It has four lines, the no leaning line, the line for leaning over a one-year, three-year, and five-year horizon. And each of these lines is a different function call of `lp_lin_panel` using different sets of variables.
+
+Before that some new variables have to defined (using lead values of existing variables) which are then used for the linear projections.
+
+```{r}
+# Some Preprocessing 
+L <- 4 # Lags in LPs
+H <- 5 # Horizon
+lean <- 5 # leaning period
+
+data <- data |>
+  mutate(
+    ifsnr = as.integer(factor(ifs)),
+    crisis_JST_new_lead1 = lead(crisis_JST_new, n = 1),
+    crisis_JST_new_lead2 = lead(crisis_JST_new, n = 2),
+    crisis_JST_new_lead3 = lead(crisis_JST_new, n = 3),
+    crisis_JST_new_lead4 = lead(crisis_JST_new, n = 4),
+    crisis_JST_new_lead5 = lead(crisis_JST_new, n = 5)
+  )
+
+booms <- c("lcredit", "lcredit_lhp", "lcredit_lsp") 
+
+for (k in seq(1, 5, by = 2)) {
+  for (n in 1:k) {
+    lagged_col_name <- paste0("lag_zFr_", n)
+    data[[lagged_col_name]] <- lag(data$zFr, n = n)
+  }
+  
+  col_name_1 <- paste0("cumu_zFr_", k)
+  data[[col_name_1]] <- rowSums(select(data, starts_with("lag_zFr_")), na.rm = TRUE)
+
+  col_name_2 <- paste0("ia_cri_zFr_", k)
+  data[[col_name_2]] <- data[[col_name_1]] * data$crisis_JST_new
+
+  # Drop columns from the data frame
+  data <- data %>%
+   select(-starts_with("lag_zFr_"))
+}
+
+for (b in booms) {
+  for (k in seq(1, 5, by = 2)) {
+    col_name_1 <- paste0("cumu_zFr_", k, "_", b)
+    name_1 <- paste0("cumu_zFr_", k)
+    name_2 <- paste0("boom_", b, "_hp_os")
+    data[[col_name_1]] <- data[[name_1]] * lag(data[[name_2]], n = 1)
+
+    col_name_2 <- paste0("ia_cri_zFr_", k, "_", "b")
+    name_3 <- paste0("ia_cri_zFr_", k)
+    data[[col_name_2]] <- data[[name_3]] * lag(data[[name_2]], n = 1)
+  }
+}
+```
+
+### Plotting for Full Sample
+
+```{r}
+data <- data[data$war == 0, ]
+
+# Model for No Leaning 
+no_leaning_data <- data |>
+  select(country, year, lgdp, starts_with("ia_cri_zFr_"), starts_with("cumu_zFr_"), starts_with("crisis_JST_new"), dstir, dltir, dlcredit, dlsp, dlhp, dlgdp, dlcpi, dlri, dlc, cay, dlsumgdp, ifsnr) 
+
+no_leaning_model <- lp_lin_panel(data_set = no_leaning_data,
+                    endog_data = "lgdp", 
+                    shock = colnames(no_leaning_data)[22],
+                    cumul_mult = TRUE, 
+                    iv_reg = TRUE, 
+                    instrum = colnames(no_leaning_data)[4:21],
+                    robust_cov = "vcovSCC", # robust standard errors
+                    c_exog_data = "ifsnr", 
+                    l_exog_data = c(colnames(no_leaning_data)[22], colnames(no_leaning_data)[28:38]),
+                    lags_exog_data = L, # lags
+                    confint = 1.96, # width of confidence interval  
+                    hor = H) # horizons
+
+# Model for Leaning Over One Year Horizon 
+leaning_one_year_data <- data |>
+  select(country, year, lgdp, ia_cri_zFr_1, cumu_zFr_1, crisis_JST_new, dstir, dltir, dlcredit, dlsp, dlhp, dlgdp, dlcpi, dlri, dlc, cay, dlsumgdp, ifsnr)
+
+leaning_one_year_model <- lp_lin_panel(data_set = leaning_one_year_data,
+                          endog_data = "lgdp", 
+                          shock = colnames(leaning_one_year_data)[6],
+                          cumul_mult = TRUE, 
+                          iv_reg = TRUE, 
+                          instrum = colnames(leaning_one_year_data)[4:5],
+                          robust_cov = "vcovSCC", # robust standard errors
+                          c_exog_data = "ifsnr", 
+                          l_exog_data = colnames(leaning_one_year_data)[7:17],
+                          lags_exog_data = L, # lags
+                          confint = 1.96, # width of confidence intervals 
+                          hor = H) # horizons
+
+# Model for Leaning Over Three Year Horizon
+leaning_three_year_data <- data |>
+  select(country, year, lgdp, ia_cri_zFr_3, cumu_zFr_3, crisis_JST_new, dstir, dltir, dlcredit, dlsp, dlhp, dlgdp, dlcpi, dlri, dlc, cay, dlsumgdp, ifsnr)
+
+leaning_three_year_model <- lp_lin_panel(data_set = leaning_three_year_data,
+                            endog_data = "lgdp", 
+                            shock = colnames(leaning_three_year_data)[6],
+                            cumul_mult = TRUE, 
+                            iv_reg = TRUE, 
+                            instrum = colnames(leaning_three_year_data)[4:5],
+                            robust_cov = "vcovSCC",  # robust standard errors
+                            c_exog_data = "ifsnr", 
+                            l_exog_data = colnames(leaning_three_year_data)[7:17],
+                            lags_exog_data = L, # lags
+                            confint = 1.96, # width of confidence intervals 
+                            hor = H)  # horizons 
+
+# Model for Leaning Over Five Year Horizon
+leaning_five_year_data <- data |>
+  select(country, year, lgdp, ia_cri_zFr_5, cumu_zFr_5, crisis_JST_new, dstir, dltir, dlcredit, dlsp, dlhp, dlgdp, dlcpi, dlri, dlc, cay, dlsumgdp, ifsnr)
+
+leaning_five_year_model <- lp_lin_panel(data_set = leaning_five_year_data,
+                           endog_data = "lgdp", 
+                           shock = colnames(leaning_five_year_data)[6],
+                           cumul_mult = TRUE, 
+                           iv_reg = TRUE, 
+                           instrum = colnames(leaning_five_year_data)[4:5],
+                           robust_cov = "vcovSCC", # robust standard errors
+                           c_exog_data = "ifsnr", 
+                           l_exog_data = colnames(leaning_five_year_data)[7:17],
+                           lags_exog_data = L, # lags
+                           confint = 1.96, # width of confidence intervals 
+                           hor = H) # horizons  
+```
+
+```{r}
+# Define plot functions for each model
+plot_no_leaning <- plot(no_leaning_model) + ggtitle("No Leaning")
+plot_leaning_one_year <- plot(leaning_one_year_model) + ggtitle("1 Year Leaning")
+plot_leaning_three_year <- plot(leaning_three_year_model) + ggtitle("3 Years Leaning")
+plot_leaning_five_year <- plot(leaning_five_year_model) + ggtitle("5 Years Leaning")
+
+# Combine plots
+grid.arrange(plot_no_leaning, plot_leaning_one_year, plot_leaning_three_year, plot_leaning_five_year, ncol=1)
+```
+
+### Plotting for Credit Booms
+
+```{r}
+data$ia_boom <- lag(data$boom_lcredit_hp_os, n = 1) * data$crisis_JST_new
+data <- data[data$war == 0, ]
+
+
+# Model for No Leaning 
+no_leaning_data <- data |>
+  select(country, year, lgdp, starts_with("ia_cri_zFr_"), starts_with("cumu_zFr_"), matches("^cumu_zFr_.*_lcredit$"), matches("^ia_cri__zFr_.*_lcredit$"), starts_with("crisis_JST_new"), ia_boom, dstir, dltir, dlcredit, dlsp, dlhp, dlgdp, dlcpi, dlri, dlc, cay, dlsumgdp, ifsnr)
+
+no_leaning_model <- lp_lin_panel(data_set = no_leaning_data,
+                    endog_data = "lgdp", 
+                    shock = "crisis_JST_new",
+                    cumul_mult = TRUE, 
+                    iv_reg = TRUE, 
+                    instrum = colnames(no_leaning_data)[4:21],
+                    robust_cov = "vcovSCC", 
+                    c_exog_data = c("ifsnr", "ia_boom"), 
+                    l_exog_data = c(colnames(no_leaning_data)[22], colnames(no_leaning_data)[29:39]),
+                    lags_exog_data = L,
+                    confint = 1.96,
+                    hor = H) 
+
+# Model for Leaning Over One Year Horizon 
+leaning_one_year_data <- data |>
+  select(country, year, lgdp, ia_cri_zFr_1, cumu_zFr_1, ia_cri_zFr_1_b, cumu_zFr_1_lcredit, ia_boom, crisis_JST_new, dstir, dltir, dlcredit, dlsp, dlhp, dlgdp, dlcpi, dlri, dlc, cay, dlsumgdp, ifsnr)
+
+leaning_one_year_model <- lp_lin_panel(data_set = leaning_one_year_data,
+                          endog_data = "lgdp", 
+                          shock = "crisis_JST_new",
+                          cumul_mult = TRUE, 
+                          iv_reg = TRUE, 
+                          instrum = colnames(leaning_one_year_data)[4:7],
+                          robust_cov = "vcovSCC", 
+                          c_exog_data = "ifsnr", 
+                          l_exog_data = colnames(leaning_one_year_data)[9:20],
+                          lags_exog_data = L,
+                          confint = 1.96,
+                          hor = H) 
+
+# Model for Leaning Over Three Year Horizon
+leaning_three_year_data <- data |>
+  select(country, year, lgdp, ia_cri_zFr_3, cumu_zFr_3, ia_cri_zFr_3_b, cumu_zFr_3_lcredit, ia_boom, crisis_JST_new, dstir, dltir, dlcredit, dlsp, dlhp, dlgdp, dlcpi, dlri, dlc, cay, dlsumgdp, ifsnr)
+
+leaning_three_year_model <- lp_lin_panel(data_set = leaning_three_year_data,
+                          endog_data = "lgdp", 
+                          shock = "crisis_JST_new",
+                          cumul_mult = TRUE, 
+                          iv_reg = TRUE, 
+                          instrum = colnames(leaning_three_year_data)[4:7],
+                          robust_cov = "vcovSCC", 
+                          c_exog_data = "ifsnr", 
+                          l_exog_data = colnames(leaning_three_year_data)[9:20],
+                          lags_exog_data = L,
+                          confint = 1.96,
+                          hor = H)   
+
+# Model for Leaning Over Five Year Horizon
+leaning_five_year_data <- data |>
+  select(country, year, lgdp, ia_cri_zFr_5, cumu_zFr_5, ia_cri_zFr_5_b, cumu_zFr_5_lcredit, ia_boom, crisis_JST_new, dstir, dltir, dlcredit, dlsp, dlhp, dlgdp, dlcpi, dlri, dlc, cay, dlsumgdp, ifsnr)
+
+leaning_five_year_model <- lp_lin_panel(data_set = leaning_five_year_data,
+                          endog_data = "lgdp", 
+                          shock = "crisis_JST_new",
+                          cumul_mult = TRUE, 
+                          iv_reg = TRUE, 
+                          instrum = colnames(leaning_five_year_data)[4:7],
+                          robust_cov = "vcovSCC", 
+                          c_exog_data = "ifsnr", 
+                          l_exog_data = colnames(leaning_five_year_data)[9:20],
+                          lags_exog_data = L,
+                          confint = 1.96,
+                          hor = H)   
+
+```
+
+```{r}
+# Define plot functions for each model
+plot_no_leaning <- plot(no_leaning_model) + ggtitle("No Leaning")
+plot_leaning_one_year <- plot(leaning_one_year_model) + ggtitle("1 Year Leaning")
+plot_leaning_three_year <- plot(leaning_three_year_model) + ggtitle("3 Years Leaning")
+plot_leaning_five_year <- plot(leaning_five_year_model) + ggtitle("5 Years Leaning")
+
+# Combine Plots 
+grid.arrange(plot_no_leaning, plot_leaning_one_year, plot_leaning_three_year, plot_leaning_five_year, ncol=1)
+```
+
+### Plotting for Credit Booms + House Price Booms
+
+```{r}
+data$ia_boom <- lag(data$boom_lcredit_lhp_hp_os, n = 1) * data$crisis_JST_new
+data <- data[data$war == 0, ]
+
+
+# Model for No Leaning 
+no_leaning_data <- data |>
+  select(country, year, lgdp, starts_with("ia_cri_zFr_"), starts_with("cumu_zFr_"), matches("^cumu_zFr_.*_lcredit_lhp$"), matches("^ia_cri__zFr_.*_lcredit_lhp$"), starts_with("crisis_JST_new"), ia_boom, dstir, dltir, dlcredit, dlsp, dlhp, dlgdp, dlcpi, dlri, dlc, cay, dlsumgdp, ifsnr)
+
+no_leaning_model <- lp_lin_panel(data_set = no_leaning_data,
+                    endog_data = "lgdp", 
+                    shock = "crisis_JST_new",
+                    cumul_mult = TRUE, 
+                    iv_reg = TRUE, 
+                    instrum = colnames(no_leaning_data)[4:21],
+                    robust_cov = "vcovSCC", 
+                    c_exog_data = c("ifsnr", "ia_boom"), 
+                    l_exog_data = c(colnames(no_leaning_data)[22], colnames(no_leaning_data)[29:39]),
+                    lags_exog_data = L,
+                    confint = 1.96,
+                    hor = H) 
+
+# Model for Leaning Over One Year Horizon 
+leaning_one_year_data <- data |>
+  select(country, year, lgdp, ia_cri_zFr_1, cumu_zFr_1, ia_cri_zFr_1_b, cumu_zFr_1_lcredit_lhp, ia_boom, crisis_JST_new, dstir, dltir, dlcredit, dlsp, dlhp, dlgdp, dlcpi, dlri, dlc, cay, dlsumgdp, ifsnr)
+
+leaning_one_year_model <- lp_lin_panel(data_set = leaning_one_year_data,
+                          endog_data = "lgdp", 
+                          shock = "crisis_JST_new",
+                          cumul_mult = TRUE, 
+                          iv_reg = TRUE, 
+                          instrum = colnames(leaning_one_year_data)[4:7],
+                          robust_cov = "vcovSCC", 
+                          c_exog_data = "ifsnr", 
+                          l_exog_data = colnames(leaning_one_year_data)[9:20],
+                          lags_exog_data = L,
+                          confint = 1.96,
+                          hor = H) 
+
+# Model for Leaning Over Three Year Horizon
+leaning_three_year_data <- data |>
+  select(country, year, lgdp, ia_cri_zFr_3, cumu_zFr_3, ia_cri_zFr_3_b, cumu_zFr_3_lcredit_lhp, ia_boom, crisis_JST_new, dstir, dltir, dlcredit, dlsp, dlhp, dlgdp, dlcpi, dlri, dlc, cay, dlsumgdp, ifsnr)
+
+leaning_three_year_model <- lp_lin_panel(data_set = leaning_three_year_data,
+                          endog_data = "lgdp", 
+                          shock = "crisis_JST_new",
+                          cumul_mult = TRUE, 
+                          iv_reg = TRUE, 
+                          instrum = colnames(leaning_three_year_data)[4:7],
+                          robust_cov = "vcovSCC", 
+                          c_exog_data = "ifsnr", 
+                          l_exog_data = colnames(leaning_three_year_data)[9:20],
+                          lags_exog_data = L,
+                          confint = 1.96,
+                          hor = H)   
+
+# Model for Leaning Over Five Year Horizon
+leaning_five_year_data <- data |>
+  select(country, year, lgdp, ia_cri_zFr_5, cumu_zFr_5, ia_cri_zFr_5_b, cumu_zFr_5_lcredit_lhp, ia_boom, crisis_JST_new, dstir, dltir, dlcredit, dlsp, dlhp, dlgdp, dlcpi, dlri, dlc, cay, dlsumgdp, ifsnr)
+
+leaning_five_year_model <- lp_lin_panel(data_set = leaning_five_year_data,
+                          endog_data = "lgdp", 
+                          shock = "crisis_JST_new",
+                          cumul_mult = TRUE, 
+                          iv_reg = TRUE, 
+                          instrum = colnames(leaning_five_year_data)[4:7],
+                          robust_cov = "vcovSCC", 
+                          c_exog_data = "ifsnr", 
+                          l_exog_data = colnames(leaning_five_year_data)[9:20],
+                          lags_exog_data = L,
+                          confint = 1.96,
+                          hor = H)   
+
+```
+
+```{r}
+# Define plot functions for each model
+plot_no_leaning <- plot(no_leaning_model) + ggtitle("No Leaning")
+plot_leaning_one_year <- plot(leaning_one_year_model) + ggtitle("1 Year Leaning")
+plot_leaning_three_year <- plot(leaning_three_year_model) + ggtitle("3 Years Leaning")
+plot_leaning_five_year <- plot(leaning_five_year_model) + ggtitle("5 Years Leaning")
+
+# Combine Plots 
+grid.arrange(plot_no_leaning, plot_leaning_one_year, plot_leaning_three_year, plot_leaning_five_year, ncol=1)
+```
+
+### Plotting for Credit Booms + Stock Price Booms
+
+```{r}
+data$ia_boom <- lag(data$boom_lcredit_lsp_hp_os, n = 1) * data$crisis_JST_new
+data <- data[data$war == 0, ]
+
+
+# Model for No Leaning 
+no_leaning_data <- data |>
+  select(country, year, lgdp, starts_with("ia_cri_zFr_"), starts_with("cumu_zFr_"), matches("^cumu_zFr_.*_lcredit_lsp$"), matches("^ia_cri__zFr_.*_lcredit_lsp$"), starts_with("crisis_JST_new"), ia_boom, dstir, dltir, dlcredit, dlsp, dlhp, dlgdp, dlcpi, dlri, dlc, cay, dlsumgdp, ifsnr)
+
+no_leaning_model <- lp_lin_panel(data_set = no_leaning_data,
+                    endog_data = "lgdp", 
+                    shock = "crisis_JST_new",
+                    cumul_mult = TRUE, 
+                    iv_reg = TRUE, 
+                    instrum = colnames(no_leaning_data)[4:21],
+                    robust_cov = "vcovSCC", 
+                    c_exog_data = c("ifsnr", "ia_boom"), 
+                    l_exog_data = c(colnames(no_leaning_data)[22], colnames(no_leaning_data)[29:39]),
+                    lags_exog_data = L,
+                    confint = 1.96,
+                    hor = H) 
+
+# Model for Leaning Over One Year Horizon 
+leaning_one_year_data <- data |>
+  select(country, year, lgdp, ia_cri_zFr_1, cumu_zFr_1, ia_cri_zFr_1_b, cumu_zFr_1_lcredit_lsp, ia_boom, crisis_JST_new, dstir, dltir, dlcredit, dlsp, dlhp, dlgdp, dlcpi, dlri, dlc, cay, dlsumgdp, ifsnr)
+
+leaning_one_year_model <- lp_lin_panel(data_set = leaning_one_year_data,
+                          endog_data = "lgdp", 
+                          shock = "crisis_JST_new",
+                          cumul_mult = TRUE, 
+                          iv_reg = TRUE, 
+                          instrum = colnames(leaning_one_year_data)[4:7],
+                          robust_cov = "vcovSCC", 
+                          c_exog_data = "ifsnr", 
+                          l_exog_data = colnames(leaning_one_year_data)[9:20],
+                          lags_exog_data = L,
+                          confint = 1.96,
+                          hor = H) 
+
+# Model for Leaning Over Three Year Horizon
+leaning_three_year_data <- data |>
+  select(country, year, lgdp, ia_cri_zFr_3, cumu_zFr_3, ia_cri_zFr_3_b, cumu_zFr_3_lcredit_lsp, ia_boom, crisis_JST_new, dstir, dltir, dlcredit, dlsp, dlhp, dlgdp, dlcpi, dlri, dlc, cay, dlsumgdp, ifsnr)
+
+leaning_three_year_model <- lp_lin_panel(data_set = leaning_three_year_data,
+                          endog_data = "lgdp", 
+                          shock = "crisis_JST_new",
+                          cumul_mult = TRUE, 
+                          iv_reg = TRUE, 
+                          instrum = colnames(leaning_three_year_data)[4:7],
+                          robust_cov = "vcovSCC", 
+                          c_exog_data = "ifsnr", 
+                          l_exog_data = colnames(leaning_three_year_data)[9:20],
+                          lags_exog_data = L,
+                          confint = 1.96,
+                          hor = H)   
+
+# Model for Leaning Over Five Year Horizon
+leaning_five_year_data <- data |>
+  select(country, year, lgdp, ia_cri_zFr_5, cumu_zFr_5, ia_cri_zFr_5_b, cumu_zFr_5_lcredit_lsp, ia_boom, crisis_JST_new, dstir, dltir, dlcredit, dlsp, dlhp, dlgdp, dlcpi, dlri, dlc, cay, dlsumgdp, ifsnr)
+
+leaning_five_year_model <- lp_lin_panel(data_set = leaning_five_year_data,
+                          endog_data = "lgdp", 
+                          shock = "crisis_JST_new",
+                          cumul_mult = TRUE, 
+                          iv_reg = TRUE, 
+                          instrum = colnames(leaning_five_year_data)[4:7],
+                          robust_cov = "vcovSCC", 
+                          c_exog_data = "ifsnr", 
+                          l_exog_data = colnames(leaning_five_year_data)[9:20],
+                          lags_exog_data = L,
+                          confint = 1.96,
+                          hor = H)   
+
+```
+
+```{r}
+# Define plot functions for each model
+plot_no_leaning <- plot(no_leaning_model) + ggtitle("No Leaning")
+plot_leaning_one_year <- plot(leaning_one_year_model) + ggtitle("1 Year Leaning")
+plot_leaning_three_year <- plot(leaning_three_year_model) + ggtitle("3 Years Leaning")
+plot_leaning_five_year <- plot(leaning_five_year_model) + ggtitle("5 Years Leaning")
+
+# Combine Plots 
+grid.arrange(plot_no_leaning, plot_leaning_one_year, plot_leaning_three_year, plot_leaning_five_year, ncol=1)
+```
+
+## Concluding Remarks
+
+In hindsight, I was overambitious with replicating some aspects of the paper and underestimated just how much time the different components would take. However, I am happy that I was able to code up functions from Stata that didn't have alternatives R and feel more confident about the prospect of undertaking an empirical macro thesis.

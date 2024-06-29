@@ -1,0 +1,167 @@
+---
+title: "Optimal Stopping"
+format: html
+editor: visual
+---
+
+## Question 1
+
+**Approach:** Say n = 1000, I first generate a random sample of 1000 scores and then select the first k elements of this sample. The max score of this sub-sample is our first stage. Then I iterate through the remaining elements of the sample and find the max score.\
+\
+Now to get , if the score is 1000 the corresponding rank is 1, for 999 the rank is 2 and so forth. So can be calculated as (n + 1 - score).
+
+```{r}
+# Question 1 
+# Define the function for the supervisor simulation
+supervisor_sim <- function(n, k) {
+  # Generate a main sample of scores, randomly sampled without replacement from 1 to n
+  supervisor_scores <- sample(1:n, n, replace = FALSE)
+  
+  # Select the first k scores for the initial sample
+  supervisor_sample <- supervisor_scores[1:k]
+  
+  # Determine the maximum score from the initial sample, i.e first stage
+  max_score <- max(supervisor_sample)
+  
+  # Iterate through the remaining scores
+  for (i in (k + 1):n) {
+    # Check if the current score is greater than the maximum score from the initial sample
+    if (supervisor_scores[i] > max_score) {
+      # Return the position of the supervisor
+      return(n + 1 - supervisor_scores[i])
+    }
+  }
+  # If no score is greater than the maximum score, return the position of the last score in reverse order
+  return(n + 1 - supervisor_scores[n])
+}
+```
+
+## Question 2
+
+The `get_prob_preferred()` is written to use `supervisor_sim()` to approximate the probability of getting your preferred supervisor for a given choice of `k` and `n` based on 10,000 simulation replications. For `k = 5` and `n = 50`, the probabilitly of getting your preferred supervisor is
+
+```{r}
+# Question 2 
+# Define the function to get probability of preferred score
+get_prob_preferred <- function(n, k, num_simulations = 10000) {
+  # Run num_simulations simulations using supervisor_sim function and store results
+  results <- replicate(num_simulations, supervisor_sim(n, k))
+  
+  # Calculate the proportion of simulations where the preferred score (1) is obtained
+  preferred_prob <- mean(results == 1)
+  
+  # Return the calculated probability
+  return(preferred_prob)
+}
+
+# Test case
+set.seed(1234)  # Set seed for reproducibility
+n <- 50          # Total number of scores
+k <- 5           # Number of initial scores to consider
+result <- get_prob_preferred(n, k)  # Call the function to get probability of preferred score
+result  # Print the result
+```
+
+## Question 3
+
+This code tries to find the optimal `k` by looping through the possible values of `k` to find the `k` which maximizes the probability of finding the most preferred supervisor. This `k` based on 100,000 simulations is given by 19.
+
+```{r}
+# Question 3 
+# Initialize variables to track optimal k and maximum probability
+max_probability <- 0  # Initialize maximum probability
+optimal_k <- 5        # Initialize optimal k
+n <- 50               # Total number of scores
+
+# Loop through possible values of k from 5 to 25
+for (k in 5:25) {
+  # Calculate probability of obtaining the preferred score for current k
+  result <- get_prob_preferred(n, k, num_simulations = 1e5)
+  
+  # Check if current result is higher than the current maximum probability
+  if (result > max_probability) {
+    max_probability <- result  # Update maximum probability
+    optimal_k <- k             # Update optimal k
+  } 
+}
+
+# Output the optimal k that maximizes the probability
+optimal_k
+
+# Output the probability of obtaining the preferred score for the optimal k
+get_prob_preferred(n, optimal_k)
+```
+
+The problem with the above approach is that it is very inefficient, especially running the third code block takes a lot of time. An alternative approach can be used taking advantage of the fact that many operations in R are vectorized.
+
+```{r}
+# Question 1 Revised
+supervisor_sim <- function(n, k) {
+  # Step 1: Generate a random sample of scores for all supervisors
+  supervisor_scores <- sample(1:n, n, replace = FALSE)  # main sample of scores
+  
+  # Step 2: Select the first k supervisors based on the generated scores
+  supervisor_sample <- supervisor_scores[1:k]
+  
+  # Step 3: Determine the maximum score among the selected supervisors
+  max_score <- max(supervisor_sample)  # first stage max score
+  
+  # Step 4: Identify supervisors in the remaining group with scores higher than max_score
+  remaining_scores <- supervisor_scores[(k + 1):n]
+  better_than_max <- remaining_scores > max_score
+  
+  # Step 5: Return the supervisor with the first score higher than max_score, if any
+  if (any(better_than_max)) {
+    first_better_index <- which(better_than_max)[1]
+    return(n + 1 - remaining_scores[first_better_index])
+  } else {
+    # Step 6: If no supervisor has a higher score, return the supervisor with the highest score in the remaining group
+    return(n + 1 - remaining_scores[length(remaining_scores)])
+  }
+}  
+```
+
+```{r}
+# Question 2 Revised
+get_prob_preferred <- function(n, k, num_simulations = 10000) {
+  # Step 1: Run num_simulations simulations of supervisor selection using supervisor_sim function
+  results <- replicate(num_simulations, supervisor_sim(n, k))  # running 1e4 simulations
+  
+  # Step 2: Calculate the probability that the preferred supervisor (with score 1) is selected
+  preferred_prob <- mean(results == 1)
+  
+  # Step 3: Return the calculated probability
+  return(preferred_prob)
+}
+
+# Test Case
+set.seed(1234)  # Setting seed for reproducibility
+n <- 50
+k <- 5
+result <- get_prob_preferred(n, k)
+result 
+
+```
+
+```{r}
+# Question 3 Revised 
+max_probability <- 0    # Initialize the maximum probability to 0
+optimal_k <- 5          # Initialize the optimal number of supervisors to 5
+n <- 50                 # Total number of supervisors
+
+# Loop through each value of k from 5 to 25
+for (k in 5:25) {
+  # Calculate the probability of selecting the preferred supervisor for current k
+  result <- get_prob_preferred(n, k, num_simulations = 1e5)
+  
+  # Update max_probability and optimal_k if the current result is higher
+  if (result > max_probability) {
+    max_probability <- result
+    optimal_k <- k
+  } 
+}
+
+# Output the optimal k value and the corresponding probability
+optimal_k  # Optimal number of initial supervisors that maximizes the probability
+get_prob_preferred(n, optimal_k)  # Probability of selecting the preferred supervisor with optimal k
+```
