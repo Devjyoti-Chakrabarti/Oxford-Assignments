@@ -1,6 +1,6 @@
 ---
 title: "Airfare Panel"
-format: gfm
+format: html
 editor: visual
 ---
 
